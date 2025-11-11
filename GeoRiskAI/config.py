@@ -21,6 +21,15 @@ AUTHOR = "Investor-Grade Architecture"
 DATE = datetime.now().strftime('%Y-%m-%d')
 OUTPUTS_DIR = 'georiskai_outputs'
 
+# --- Pretrained Model Integration ---
+# Default locations can be overridden via environment variables to support
+# alternative deployment layouts without touching code.
+PRETRAINED_MODEL_PATH = os.getenv("PRETRAINED_MODEL_PATH", "final_ensemble.pkl")
+PRETRAINED_SUPPORT_PATH = os.getenv(
+    "PRETRAINED_SUPPORT_PATH",
+    r"C:\Users\arham\CascadeProjects\Model training\1",
+)
+
 # --- Region of Interest (ROI) ---
 # Example: A flood-prone region in Uttarakhand, India.
 ROI_BOUNDS = [78.65, 30.90, 78.95, 31.20]
