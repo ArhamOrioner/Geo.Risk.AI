@@ -285,7 +285,7 @@ def run_prediction_pipeline_safe(model):
             logging.warning(f"Low data coverage: {coverage.get('coverage_ratio', 0):.2f}, but continuing with available data")
         
         df_raw.to_csv(os.path.join(config.OUTPUTS_DIR, 'raw_sampled_data.csv'), index=False)
-        df_clean = analysis.clean_and_prepare_data(df_raw.copy())
+        df_clean = analysis.clean_and_prepare_data(df_raw.copy(), df_raw)
 
         prediction_results_df = model.predict_per_pixel(df_clean)
         df_final = df_clean.join(prediction_results_df)
