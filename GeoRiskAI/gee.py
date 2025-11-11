@@ -8,13 +8,306 @@ from datetime import timedelta, datetime
 import config as _cfg
 import math
 
+
+IMERG_COLLECTION = ee.ImageCollection("NASA/GPM_L3/IMERG_V07").select("precipitation")
+SMAP_COLLECTION = ee.ImageCollection("NASA/SMAP/SPL4SMGP/007")
+SMAP_SURFACE_BAND = "sm_surface_analysis"
+SMAP_SUBSURFACE_BAND = "sm_rootzone_analysis"
+GFS_COLLECTION = ee.ImageCollection("NOAA/GFS0P25")
+GSW_OCCURRENCE_IMAGE = ee.Image("JRC/GSW1_4/GlobalSurfaceWater").select("occurrence").rename("gee_gsw_occurrence_mean")
+MERIT_UPA_IMAGE = ee.Image("MERIT/Hydro/v1_0_1").select("upa").rename("gee_merit_upa_mean")
+GLOFAS_FORECAST_BANDS = (
+    "glofas_forecast_control",
+    "glofas_forecast_mean",
+    "glofas_forecast_median",
+    "glofas_forecast_std_dev",
+    "glofas_forecast_10th_percentile",
+    "glofas_forecast_90th_percentile",
+)
+GLOFAS_EMPTY_IMAGE = ee.Image.constant([0.0] * len(GLOFAS_FORECAST_BANDS)).rename(list(GLOFAS_FORECAST_BANDS))
+_GLOFAS_WARNING_EMITTED = False
+
+
+def _empty_band(name: str, value: float = 0.0) -> ee.Image:
+    return ee.Image.constant(value).rename(name)
+
+
+def _safe_image(expr: ee.ComputedObject, fallback: ee.Image) -> ee.Image:
+    return ee.Image(ee.Algorithms.If(ee.Algorithms.IsEqual(expr, None), fallback, expr))
+
+
+def build_imerg_feature_image(start_date: str, end_date: str) -> ee.Image:
+    end = ee.Date(end_date)
+    start_24h = end.advance(-1, 'day')
+    start_3d = end.advance(-3, 'day')
+    start_7d = end.advance(-7, 'day')
+
+    coll_24h = IMERG_COLLECTION.filterDate(start_24h, end)
+    coll_3d = IMERG_COLLECTION.filterDate(start_3d, end)
+    coll_7d = IMERG_COLLECTION.filterDate(start_7d, end)
+
+    sum_24h = ee.Image(ee.Algorithms.If(
+        coll_24h.size().gt(0),
+        coll_24h.sum().multiply(0.5),
+        ee.Image.constant(0)
+    )).rename("gee_imerg_sum_24h_mm")
+
+    sum_3d = ee.Image(ee.Algorithms.If(
+        coll_3d.size().gt(0),
+        coll_3d.sum().multiply(0.5),
+        ee.Image.constant(0)
+    )).rename("gee_imerg_sum_3d_before_mm")
+
+    sum_7d = ee.Image(ee.Algorithms.If(
+        coll_7d.size().gt(0),
+        coll_7d.sum().multiply(0.5),
+        ee.Image.constant(0)
+    )).rename("gee_imerg_sum_7d_before_mm")
+
+    max_1h_raw = ee.Image(ee.Algorithms.If(
+        coll_24h.size().gt(0),
+        coll_24h.max(),
+        ee.Image.constant(0)
+    ))
+
+    max_1h = max_1h_raw.rename("gee_imerg_max_1h_intensity_mm")
+    max_1h_dup = max_1h_raw.rename("imerg_max_1h_intensity_mm")
+
+    mean_1h = ee.Image(ee.Algorithms.If(
+        coll_24h.size().gt(0),
+        coll_24h.mean(),
+        ee.Image.constant(0)
+    )).rename("imerg_mean_1h_intensity_mm")
+
+    max_3h = max_1h_raw.multiply(1.5).rename("gee_imerg_max_3h_intensity_mm")
+    max_6h = max_1h_raw.multiply(2.0).rename("gee_imerg_max_6h_intensity_mm")
+
+    intensity_3d = sum_3d.divide(3.0).rename("gee_imerg_intensity_3d_mm_per_day")
+    intensity_7d = sum_7d.divide(7.0).rename("gee_imerg_intensity_7d_mm_per_day")
+
+    daily_sequence = ee.List.sequence(1, 7)
+
+    def _daily_sum(day):
+        day = ee.Number(day)
+        day_start = end.advance(day.multiply(-1), 'day')
+        day_end = day_start.advance(1, 'day')
+        coll = IMERG_COLLECTION.filterDate(day_start, day_end)
+        return ee.Image(ee.Algorithms.If(
+            coll.size().gt(0),
+            coll.sum().multiply(0.5),
+            ee.Image.constant(0)
+        )).rename("daily_sum")
+
+    daily_collection = ee.ImageCollection(daily_sequence.map(_daily_sum))
+    max_daily_7d = ee.Image(ee.Algorithms.If(
+        daily_collection.size().gt(0),
+        daily_collection.max(),
+        ee.Image.constant(0)
+    )).rename("gee_imerg_max_daily_7d_mm")
+
+    imerg_features = ee.Image.cat([
+        sum_24h,
+        sum_3d,
+        sum_7d,
+        max_1h,
+        max_1h_dup,
+        max_3h,
+        max_6h,
+        mean_1h,
+        intensity_3d,
+        intensity_7d,
+        max_daily_7d,
+    ])
+
+    return imerg_features
+
+
+def build_smap_feature_image(start_date: str, end_date: str) -> ee.Image:
+    end = ee.Date(end_date)
+    current_start = end.advance(-3, 'day')
+    climatology_start = end.advance(-60, 'day')
+    climatology_end = end.advance(-30, 'day')
+
+    current = SMAP_COLLECTION.filterDate(current_start, end)
+    climatology = SMAP_COLLECTION.filterDate(climatology_start, climatology_end)
+
+    surface = ee.Image(ee.Algorithms.If(
+        current.size().gt(0),
+        current.select(SMAP_SURFACE_BAND).mean(),
+        ee.Image.constant(0)
+    )).rename("gee_smap_surface_soil_moisture")
+
+    subsurface = ee.Image(ee.Algorithms.If(
+        current.size().gt(0),
+        current.select(SMAP_SUBSURFACE_BAND).mean(),
+        ee.Image.constant(0)
+    )).rename("gee_smap_subsurface_soil_moisture")
+
+    climatology_surface = ee.Image(ee.Algorithms.If(
+        climatology.size().gt(0),
+        climatology.select(SMAP_SURFACE_BAND).mean(),
+        ee.Image.constant(0)
+    ))
+
+    anomaly = surface.subtract(climatology_surface).rename("gee_smap_soil_moisture_anomaly")
+
+    return ee.Image.cat([surface, subsurface, anomaly])
+
+
+def build_engineered_features_image(
+    imerg_img: ee.Image,
+    smap_img: ee.Image,
+    topo_img: ee.Image,
+    upa_img: ee.Image,
+) -> ee.Image:
+    sum_24h = imerg_img.select("gee_imerg_sum_24h_mm")
+    sum_3d = imerg_img.select("gee_imerg_sum_3d_before_mm")
+    sum_7d = imerg_img.select("gee_imerg_sum_7d_before_mm")
+    max_1h = imerg_img.select("gee_imerg_max_1h_intensity_mm")
+    slope = topo_img.select("gee_slope_mean")
+    surface_sm = smap_img.select("gee_smap_surface_soil_moisture")
+    upa = upa_img.select("gee_merit_upa_mean")
+
+    api = sum_24h.multiply(0.5).add(sum_3d.multiply(0.3)).add(sum_7d.multiply(0.2)).rename("gee_api_weighted_mm")
+
+    flashiness = max_1h.divide(sum_24h.divide(24.0).add(1e-6)).rename("gee_flashiness_index")
+    flashiness_7d = max_1h.divide(sum_7d.divide(7.0).add(1e-6)).rename("gee_flashiness_index_7d")
+
+    saturation = surface_sm.divide(sum_7d.add(1.0)).rename("gee_saturation_proxy")
+
+    runoff = sum_24h.multiply(slope).divide(surface_sm.add(0.01)).rename("gee_runoff_potential")
+
+    precip_slope = sum_7d.multiply(slope).rename("gee_precip_x_slope")
+
+    antecedent = sum_3d.multiply(0.6).add(sum_7d.multiply(0.4)).rename("gee_antecedent_moisture_proxy")
+
+    # Retain TWI from topo image, computed using upstream area proxy.
+    twi = topo_img.select("gee_twi")
+
+    return ee.Image.cat([
+        api,
+        flashiness,
+        flashiness_7d,
+        saturation,
+        runoff,
+        precip_slope,
+        antecedent,
+        twi,
+    ])
+
+
+def build_glofas_feature_image(start_date: str, end_date: str) -> ee.Image:
+    global _GLOFAS_WARNING_EMITTED
+    if not _GLOFAS_WARNING_EMITTED:
+        logging.warning("GloFAS forecasts not yet integrated; using zero-filled ensemble bands.")
+        _GLOFAS_WARNING_EMITTED = True
+    return GLOFAS_EMPTY_IMAGE
+
 # Standardized band list used across the pipeline. Every returned image
 # will be coerced to contain exactly these bands (missing bands filled with 0).
-STANDARD_BANDS = [
+STATIC_FEATURE_BANDS = [
+    "gee_api_weighted_mm",
+    "gee_aspect_mean",
+    "gee_elevation_mean",
+    "gee_flashiness_index",
+    "gee_gsw_occurrence_mean",
+    "gee_imerg_intensity_7d_mm_per_day",
+    "gee_imerg_max_daily_7d_mm",
+    "gee_imerg_sum_7d_before_mm",
+    "gee_merit_upa_mean",
+    "gee_ndbi_mean_30d",
+    "gee_ndvi_mean_30d",
+    "gee_ndwi_mean_30d",
+    "gee_saturation_proxy",
+    "gee_slope_mean",
+    "gee_smap_subsurface_soil_moisture",
+    "gee_smap_surface_soil_moisture",
+    "gee_twi",
+]
+
+DYNAMIC_FEATURE_BANDS = [
+    "gee_antecedent_moisture_proxy",
+    "gee_flashiness_index_7d",
+    "gee_imerg_intensity_3d_mm_per_day",
+    "gee_imerg_max_1h_intensity_mm",
+    "gee_imerg_max_3h_intensity_mm",
+    "gee_imerg_max_6h_intensity_mm",
+    "gee_imerg_sum_24h_mm",
+    "gee_imerg_sum_3d_before_mm",
+    "gee_precip_x_slope",
+    "gee_runoff_potential",
+    "gee_smap_soil_moisture_anomaly",
+    "glofas_forecast_10th_percentile",
+    "glofas_forecast_90th_percentile",
+    "glofas_forecast_control",
+    "glofas_forecast_mean",
+    "glofas_forecast_median",
+    "glofas_forecast_std_dev",
+    "imerg_max_1h_intensity_mm",
+    "imerg_mean_1h_intensity_mm",
+]
+
+ENGINEERED_FEATURE_BANDS = (
+    "gee_api_weighted_mm",
+    "gee_flashiness_index",
+    "gee_flashiness_index_7d",
+    "gee_saturation_proxy",
+    "gee_runoff_potential",
+    "gee_precip_x_slope",
+    "gee_antecedent_moisture_proxy",
+    "gee_twi",
+)
+
+FULL_FEATURE_BANDS = [
+    "imerg_max_1h_intensity_mm",
+    "imerg_mean_1h_intensity_mm",
+    "gee_imerg_sum_24h_mm",
+    "gee_imerg_max_1h_intensity_mm",
+    "gee_imerg_max_3h_intensity_mm",
+    "gee_imerg_max_6h_intensity_mm",
+    "gee_imerg_sum_3d_before_mm",
+    "gee_imerg_sum_7d_before_mm",
+    "gee_imerg_max_daily_7d_mm",
+    "gee_imerg_intensity_3d_mm_per_day",
+    "gee_imerg_intensity_7d_mm_per_day",
+    "gee_smap_surface_soil_moisture",
+    "gee_smap_subsurface_soil_moisture",
+    "gee_smap_soil_moisture_anomaly",
+    "gee_antecedent_moisture_proxy",
+    "gee_flashiness_index_7d",
+    "gee_api_weighted_mm",
+    "gee_flashiness_index",
+    "gee_saturation_proxy",
+    "gee_runoff_potential",
+    "gee_aspect_mean",
+    "gee_elevation_mean",
+    "gee_slope_mean",
+    "gee_gsw_occurrence_mean",
+    "gee_merit_upa_mean",
+    "gee_twi",
+    "gee_ndvi_mean_30d",
+    "gee_ndbi_mean_30d",
+    "gee_ndwi_mean_30d",
+    "gee_precip_x_slope",
+    "glofas_forecast_control",
+    "glofas_forecast_mean",
+    "glofas_forecast_median",
+    "glofas_forecast_std_dev",
+    "glofas_forecast_10th_percentile",
+    "glofas_forecast_90th_percentile",
+]
+
+BASELINE_BANDS = [
     'Elevation','Slope','TWI','Flow_Accumulation','Channel_Mask','Dist_To_Channel_m',
     'NDVI','NDWI','Total_Precipitation','Max_Daily_Precipitation','Land_Cover','viirs_flood_mask',
     'clay_mean_0cm','sand_mean_0cm','bdod_mean_0cm','soc_mean_0cm','phh2o_mean_0cm'
 ]
+
+STANDARD_BANDS = BASELINE_BANDS + sorted(
+    set(STATIC_FEATURE_BANDS)
+    | set(DYNAMIC_FEATURE_BANDS)
+    | set(FULL_FEATURE_BANDS)
+)
 
 
 def initialize_gee():
@@ -116,58 +409,37 @@ def get_dem_features_optimized(roi):
         
         elevation = dem.rename('Elevation')
         slope = ee.Terrain.slope(dem).rename('Slope')
-        
+        aspect = ee.Terrain.aspect(dem).rename('Aspect')
+
         filled = dem.focal_min(radius=30, kernelType='circle')
         flow_accum = filled.reduceNeighborhood(
             reducer=ee.Reducer.mean(),
             kernel=ee.Kernel.circle(radius=60)
         ).rename('Flow_Accumulation')
-        
+
         slope_rad = slope.multiply(math.pi / 180.0)
         twi = flow_accum.divide(slope_rad.tan().max(0.001)).log().rename('TWI')
-        
+
         thr = ee.Number(float(getattr(_cfg, 'CHANNEL_FLOWACC_THRESHOLD', 500.0)))
         channel_mask = flow_accum.gt(thr).selfMask().rename('Channel_Mask')
-        
+
         dist = channel_mask.fastDistanceTransform(256).sqrt().multiply(ee.Image.pixelArea().sqrt()).rename("Dist_To_Channel_m")
-        
+
         # Build a multi-band image from the DEM-derived bands
-        result = elevation.addBands([slope, twi, flow_accum, channel_mask, dist])
+        result = elevation.addBands([slope, aspect, twi, flow_accum, channel_mask, dist])
+        result = result.addBands([
+            elevation.rename('gee_elevation_mean'),
+            slope.rename('gee_slope_mean'),
+            aspect.rename('gee_aspect_mean'),
+            twi.rename('gee_twi'),
+        ])
         # Enforce schema before returning
         return enforce_band_schema(result.reproject(crs='EPSG:4326', scale=30))
-        
+
     except Exception as e:
         logging.error(f"Could not process topographic data: {e}", exc_info=True)
-        return None
-
-
-def get_soil_properties_optimized(roi):
-    """Memory-optimized soil properties - select fewer variables."""
-    try:
-        essential_variables = [
-            "clay_mean", "sand_mean", "bdod_mean", "soc_mean", "phh2o_mean"
-        ]
-        
-        images = []
-        for var in essential_variables:
-            try:
-                asset = f"projects/soilgrids-isric/{var}"
-                img = ee.Image(asset)
-                surface_band = img.select([img.bandNames().get(0)])
-                images.append(surface_band.rename(f"{var}_0cm"))
-            except Exception as var_error:
-                logging.warning(f"Could not load soil variable {var}: {var_error}")
-                continue
-        
-        if images:
-            soil_img = ee.Image.cat(images).clip(roi)
-            return enforce_band_schema(soil_img.reproject(crs='EPSG:4326', scale=250))
-        else:
-            return None
-            
-    except Exception as e:
-        logging.error(f"Could not load SoilGrids data: {e}", exc_info=True)
-        return None
+        fallback = ee.Image.constant([0.0] * len(STANDARD_BANDS)).rename(STANDARD_BANDS)
+        return fallback
 
 
 def get_vegetation_indices_optimized(roi, start_date, end_date):
@@ -199,9 +471,14 @@ def get_vegetation_indices_optimized(roi, start_date, end_date):
         collection_size = s2_masked.size()
         
         def compute_indices(image):
-            ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI')
-            ndwi = image.normalizedDifference(['B3', 'B8']).rename('NDWI')
-            return ndvi.addBands(ndwi)
+            ndvi_raw = image.normalizedDifference(['B8', 'B4'])
+            ndwi_raw = image.normalizedDifference(['B3', 'B8'])
+            return ee.Image.cat([
+                ndvi_raw.rename('NDVI'),
+                ndwi_raw.rename('NDWI'),
+                ndvi_raw.rename('gee_ndvi_mean_30d'),
+                ndwi_raw.rename('gee_ndwi_mean_30d'),
+            ])
         
         median_image = ee.Algorithms.If(
             collection_size.gt(0),
@@ -210,68 +487,38 @@ def get_vegetation_indices_optimized(roi, start_date, end_date):
         )
         
         result = compute_indices(ee.Image(median_image))
+
+        # Add Landsat-derived NDBI for 30-day window
+        try:
+            l8_start = end.advance(-30, 'day')
+            l8 = (
+                ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+                .filterDate(l8_start, end)
+                .filterBounds(roi)
+            )
+
+            def _ndbi(img):
+                scaled = img.select(["SR_B5", "SR_B6"]).multiply(0.0000275).add(-0.2)
+                nir = scaled.select("SR_B5")
+                swir1 = scaled.select("SR_B6")
+                ndbi = swir1.subtract(nir).divide(swir1.add(nir).add(1e-6)).rename("gee_ndbi_mean_30d")
+                return ndbi
+
+            ndbi_coll = l8.map(_ndbi)
+            ndbi_mean = ee.Image(ee.Algorithms.If(
+                ndbi_coll.size().gt(0),
+                ndbi_coll.mean(),
+                ee.Image.constant(0).rename("gee_ndbi_mean_30d"),
+            ))
+            result = result.addBands(ndbi_mean)
+        except Exception:
+            result = result.addBands(_empty_band("gee_ndbi_mean_30d"))
+
         return enforce_band_schema(result.reproject(crs='EPSG:4326', scale=60))
-        
+
     except Exception as e:
         logging.error(f"Could not process vegetation indices: {e}", exc_info=True)
         return enforce_band_schema(ee.Image.constant([0] * len(STANDARD_BANDS)).rename(STANDARD_BANDS)).clip(roi)
-
-
-def get_precipitation_optimized(roi, start_date, end_date):
-    """Memory-optimized precipitation with reduced complexity."""
-    try:
-        start = ee.Date(start_date)
-        end = ee.Date(end_date)
-        
-        era5_collection = (
-            ee.ImageCollection("ECMWF/ERA5_LAND/HOURLY")
-            .filterDate(start, end)
-            .filterBounds(roi)
-            .select('total_precipitation_hourly')
-        )
-        
-        total_precip = era5_collection.sum().multiply(1000).rename('Total_Precipitation')
-        
-        days = ee.List.sequence(0, end.difference(start, 'day').subtract(1))
-        def daily_precip(day_offset):
-            day_start = start.advance(day_offset, 'day')
-            day_end = day_start.advance(1, 'day')
-            return era5_collection.filterDate(day_start, day_end).sum().set('system:time_start', day_start.millis())
-
-        # If days is empty this will still be safe; later we enforce schema
-        daily_images = ee.ImageCollection.fromImages(days.map(daily_precip))
-        max_daily = daily_images.max().multiply(1000).rename('Max_Daily_Precipitation')
-        
-        result = total_precip.addBands(max_daily)
-        return enforce_band_schema(result.reproject(crs='EPSG:4326', scale=11000))
-        
-    except Exception as e:
-        logging.error(f"Could not process precipitation data: {e}", exc_info=True)
-        return None
-
-
-def get_landcover_optimized(roi):
-    """Simple land cover with memory optimization."""
-    try:
-        lc = ee.Image("ESA/WorldCover/v100/2020").select('Map').clip(roi).rename('Land_Cover')
-        return enforce_band_schema(lc.reproject(crs='EPSG:4326', scale=100))
-    except Exception as e:
-        logging.error(f"Could not process land cover data: {e}", exc_info=True)
-        return None
-
-
-def get_viirs_flood_proxy(roi, start_date, end_date):
-    """Creates a recent surface water proxy from JRC Monthly History."""
-    try:
-        water = (ee.ImageCollection("JRC/GSW1_4/MonthlyHistory")
-                 .filterDate(start_date, end_date)
-                 .select('water'))
-        water_remapped = water.map(lambda img: img.remap([0, 1, 2], [0, 0, 1]))
-        flood_mask = water_remapped.max().rename('viirs_flood_mask')
-        return enforce_band_schema(flood_mask).unmask(0)
-    except Exception as e:
-        logging.error(f"Could not create VIIRS flood proxy: {e}", exc_info=True)
-        return None
 
 
 def process_roi_chunk(roi_chunk, start_date, end_date, chunk_id):
@@ -280,26 +527,52 @@ def process_roi_chunk(roi_chunk, start_date, end_date, chunk_id):
     
     try:
         layers = []
-        
+
         topo = get_dem_features_optimized(roi_chunk)
-        if topo: layers.append(topo)
-        
+        layers.append(topo)
+
         veg = get_vegetation_indices_optimized(roi_chunk, start_date, end_date)
-        if veg: layers.append(veg)
-        
+        layers.append(veg)
+
         precip = get_precipitation_optimized(roi_chunk, start_date, end_date)
         if precip: layers.append(precip)
-        
+
         lc = get_landcover_optimized(roi_chunk)
         if lc: layers.append(lc)
-        
+
         viirs = get_viirs_flood_proxy(roi_chunk, start_date, end_date)
         if viirs: layers.append(viirs)
-        
+
         if len(layers) < 4:
             soil = get_soil_properties_optimized(roi_chunk)
             if soil: layers.append(soil)
-        
+
+        imerg_img = build_imerg_feature_image(start_date, end_date).clip(roi_chunk)
+        smap_img = build_smap_feature_image(start_date, end_date).clip(roi_chunk)
+        upa_img = MERIT_UPA_IMAGE.clip(roi_chunk)
+        gsw_img = GSW_OCCURRENCE_IMAGE.clip(roi_chunk)
+        glofas_img = build_glofas_feature_image(start_date, end_date).clip(roi_chunk)
+
+        layers.append(imerg_img)
+        layers.append(smap_img)
+        layers.append(upa_img)
+        layers.append(gsw_img)
+        layers.append(glofas_img)
+
+        if topo is None:
+            topo_for_engineering = _empty_band("gee_slope_mean").addBands(_empty_band("gee_twi")).addBands(_empty_band("gee_aspect_mean"))
+        else:
+            topo_for_engineering = topo
+
+        engineered = build_engineered_features_image(
+            imerg_img,
+            smap_img,
+            topo_for_engineering,
+            upa_img,
+        ).clip(roi_chunk)
+
+        layers.append(engineered)
+
         if not layers:
             logging.error(f"No valid layers for chunk {chunk_id}")
             # Return a well-formed empty image with all STANDARD_BANDS (masked)
