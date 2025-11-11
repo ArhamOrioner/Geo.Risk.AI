@@ -22,6 +22,21 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from google.auth import default
 
+try:
+    from ML import STATIC_FEATURES as ENSEMBLE_STATIC_FEATURES
+    from ML import DYNAMIC_FEATURES as ENSEMBLE_DYNAMIC_FEATURES
+    from ML import FULL_FEATURES as ENSEMBLE_FULL_FEATURES
+except Exception:  # pragma: no cover - fallback when ML import fails during docs/build
+    ENSEMBLE_STATIC_FEATURES = []
+    ENSEMBLE_DYNAMIC_FEATURES = []
+    ENSEMBLE_FULL_FEATURES = []
+
+ALL_ENSEMBLE_FEATURES = sorted(
+    set(ENSEMBLE_STATIC_FEATURES)
+    | set(ENSEMBLE_DYNAMIC_FEATURES)
+    | set(ENSEMBLE_FULL_FEATURES)
+)
+
 def get_drive_service():
     """Builds and returns a Google Drive service object."""
     creds, _ = default()
@@ -112,10 +127,12 @@ def sample_to_dataframe(image, roi, num_pixels, random_state=42):
         return None, {"requested": int(num_pixels), "returned": 0, "coverage_ratio": 0.0, "sample_scale_m": float(scale)}
 
 
-def clean_and_prepare_data(df):
+def clean_and_prepare_data(df, df_source):
     """Cleans and prepares the sampled data."""
     logging.info("Cleaning and preparing sampled data...")
     for col in df.columns:
+        if col not in df_source.columns:
+            continue
         if pd.api.types.is_numeric_dtype(df[col]) and df[col].isnull().any():
             df[col] = df[col].fillna(df[col].median())
     
@@ -130,7 +147,24 @@ def clean_and_prepare_data(df):
         df['Land_Cover_Type'] = 'Unknown'
         
     logging.info("Data preparation complete.")
-    return df
+    return ensure_ensemble_feature_columns(df)
+
+
+def ensure_ensemble_feature_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Guarantee the sampled dataframe exposes all ensemble feature columns."""
+    df_out = df.copy()
+
+    missing = [col for col in ALL_ENSEMBLE_FEATURES if col not in df_out.columns]
+    if missing:
+        logging.debug("Adding %d missing ensemble columns: %s", len(missing), missing)
+        for col in missing:
+            df_out[col] = np.nan
+
+    present = [col for col in ALL_ENSEMBLE_FEATURES if col in df_out.columns]
+    if present:
+        df_out[present] = df_out[present].apply(pd.to_numeric, errors="coerce")
+
+    return df_out
 
 def tune_hdbscan_params(X, min_cluster_range=(10, 200), min_samples_factor=(1, 5)):
     """
