@@ -10,6 +10,8 @@
 
 import os
 from datetime import datetime, timedelta
+from pathlib import Path
+
 from dotenv import load_dotenv
 
 # Load environment variables from a .env file
@@ -27,7 +29,7 @@ OUTPUTS_DIR = 'georiskai_outputs'
 PRETRAINED_MODEL_PATH = os.getenv("PRETRAINED_MODEL_PATH", "final_ensemble.pkl")
 PRETRAINED_SUPPORT_PATH = os.getenv(
     "PRETRAINED_SUPPORT_PATH",
-    r"C:\Users\arham\CascadeProjects\Model training\1",
+    str(Path(__file__).resolve().parent / "1"),
 )
 
 # --- Region of Interest (ROI) ---
